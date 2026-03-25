@@ -1,0 +1,9 @@
+services:
+  mcp-proxy:
+    build: .
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./data:/data
+    env_file:
+      - .env
