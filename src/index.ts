@@ -25,7 +25,7 @@ import {
 import express, { type Request, type Response, type NextFunction } from "express";
 import crypto from "crypto";
 
-import { PORT, EXTERNAL_URL, OAUTH_CALLBACK_URI, loadOrCreateApiKey, loadConfig, getBaseUrl } from "./config.js";
+import { DATA_DIR, PORT, EXTERNAL_URL, OAUTH_CALLBACK_URI, loadOrCreateApiKey, loadConfig, getBaseUrl } from "./config.js";
 import {
   discoverAuthServer,
   resolveClientCredentials,
@@ -57,10 +57,13 @@ let allConfigs: UpstreamConfig[];
 
 // ── Auth helpers ─────────────────────────────────────────────────────────────
 
-function pruneAuthCodes(): void {
+function pruneExpired(): void {
   const now = Date.now();
   for (const [code, data] of authCodes) {
     if (data.expiresAt < now) authCodes.delete(code);
+  }
+  for (const [state, flow] of pendingOAuthFlows) {
+    if (flow.expiresAt < now) pendingOAuthFlows.delete(state);
   }
 }
 
@@ -194,15 +197,16 @@ function serverMetadata(base: string): object {
 function startHttpServer(mcpServer: Server, apiKey: string): void {
   const app = express();
 
-  // CORS — MCP clients may run on different ports/origins
-  app.use((_req: Request, res: Response, next: NextFunction): void => {
+  // CORS — only on MCP/discovery/OAuth endpoints (not dashboard/upstream management)
+  const corsRoutes = ["/mcp", "/.well-known", "/oauth", "/register", "/authorize", "/token"];
+  app.use(corsRoutes, (_req: Request, res: Response, next: NextFunction): void => {
     res.set("Access-Control-Allow-Origin", "*");
-    res.set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
     res.set("Access-Control-Expose-Headers", "WWW-Authenticate");
     next();
   });
-  app.options("*", (_req: Request, res: Response): void => { res.sendStatus(204); });
+  app.options(corsRoutes, (_req: Request, res: Response): void => { res.sendStatus(204); });
 
   app.use(express.json());
   app.use(express.urlencoded({ extended: false }));
@@ -298,7 +302,7 @@ function startHttpServer(mcpServer: Server, apiKey: string): void {
       return;
     }
 
-    pruneAuthCodes();
+    pruneExpired();
     const code = crypto.randomBytes(32).toString("hex");
     authCodes.set(code, {
       challenge: code_challenge,
@@ -355,7 +359,8 @@ function startHttpServer(mcpServer: Server, apiKey: string): void {
       res.redirect("/login");
       return;
     }
-    res.setHeader("Set-Cookie", `${COOKIE_NAME}=${sessionHash()}; Path=/; HttpOnly; SameSite=Lax`);
+    const secure = EXTERNAL_URL.startsWith("https") ? "; Secure" : "";
+    res.setHeader("Set-Cookie", `${COOKIE_NAME}=${sessionHash()}; Path=/; HttpOnly; SameSite=Lax${secure}`);
     res.redirect("/dashboard");
   });
 
@@ -466,6 +471,7 @@ function startHttpServer(mcpServer: Server, apiKey: string): void {
         scopes: config.auth.scopes, resource: config.url,
       });
 
+      pruneExpired();
       pendingOAuthFlows.set(state, {
         upstreamName: name, codeVerifier, asMetadata, clientCreds,
         redirectUri, resource: config.url, expiresAt: Date.now() + 10 * 60 * 1000,
@@ -539,7 +545,7 @@ function startHttpServer(mcpServer: Server, apiKey: string): void {
 
 async function main(): Promise<void> {
   const apiKey = loadOrCreateApiKey();
-  console.log(`[proxy] API key: Bearer ${apiKey}`);
+  console.log(`[proxy] API key: ${apiKey.slice(0, 8)}...(see ${DATA_DIR}/api_key)`);
 
   allConfigs = loadConfig();
   connectedUpstreams = await connectAllUpstreams(allConfigs);
