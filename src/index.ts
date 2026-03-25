@@ -194,8 +194,33 @@ function serverMetadata(base: string): object {
   };
 }
 
+/** Constant-time string comparison to prevent timing attacks. */
+function safeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
+/** Simple global rate limiter for auth endpoints. */
+function createRateLimiter(maxAttempts: number, windowMs: number) {
+  let count = 0;
+  let resetAt = 0;
+  return {
+    check(): boolean {
+      const now = Date.now();
+      if (now >= resetAt) {
+        count = 1;
+        resetAt = now + windowMs;
+        return true;
+      }
+      count++;
+      return count <= maxAttempts;
+    },
+  };
+}
+
 function startHttpServer(mcpServer: Server, apiKey: string): void {
   const app = express();
+  const authLimiter = createRateLimiter(5, 60_000); // 5 attempts per minute per IP
 
   // CORS — only on MCP/discovery/OAuth endpoints (not dashboard/upstream management)
   const corsRoutes = ["/mcp", "/.well-known", "/oauth", "/register", "/authorize", "/token"];
@@ -279,6 +304,10 @@ function startHttpServer(mcpServer: Server, apiKey: string): void {
   });
 
   app.post("/authorize", (req: Request, res: Response): void => {
+    if (!authLimiter.check()) {
+      res.status(429).send("Too many attempts. Try again in a minute.");
+      return;
+    }
     const body = req.body as Record<string, string>;
     const { redirect_uri, code_challenge, state, api_key } = body;
 
@@ -295,7 +324,7 @@ function startHttpServer(mcpServer: Server, apiKey: string): void {
       return;
     }
 
-    if (api_key !== apiKey) {
+    if (!safeEqual(api_key ?? "", apiKey)) {
       redirectUrl.searchParams.set("error", "access_denied");
       if (state) redirectUrl.searchParams.set("state", state);
       res.redirect(redirectUrl.toString());
@@ -354,8 +383,12 @@ function startHttpServer(mcpServer: Server, apiKey: string): void {
   });
 
   app.post("/login", (req: Request, res: Response): void => {
+    if (!authLimiter.check()) {
+      res.status(429).send("Too many login attempts. Try again in a minute.");
+      return;
+    }
     const { api_key } = req.body as Record<string, string>;
-    if (api_key !== apiKey) {
+    if (!safeEqual(api_key ?? "", apiKey)) {
       res.redirect("/login");
       return;
     }
@@ -370,7 +403,7 @@ function startHttpServer(mcpServer: Server, apiKey: string): void {
       if (k) acc[k] = v.join("=");
       return acc;
     }, {} as Record<string, string>);
-    if (cookies[COOKIE_NAME] === sessionHash()) {
+    if (safeEqual(cookies[COOKIE_NAME] ?? "", sessionHash())) {
       next();
       return;
     }
@@ -511,7 +544,7 @@ function startHttpServer(mcpServer: Server, apiKey: string): void {
 
   app.use((req: Request, res: Response, next: NextFunction): void => {
     const auth = req.headers["authorization"];
-    if (!auth || auth !== `Bearer ${apiKey}`) {
+    if (!auth || !safeEqual(auth, `Bearer ${apiKey}`)) {
       const base = getBaseUrl(req);
       res.set("WWW-Authenticate", `Bearer realm="${base}", resource_metadata="${base}/.well-known/oauth-protected-resource/mcp"`);
       res.status(401).json({ error: "Unauthorized" });
