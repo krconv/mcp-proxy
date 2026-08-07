@@ -31,6 +31,7 @@ import {
   resolveClientCredentials,
   buildAuthorizationUrl,
   exchangeCodeForTokens,
+  refreshAccessToken,
   saveTokens,
   loadTokens,
   deleteTokens,
@@ -131,6 +132,109 @@ async function connectOAuthUpstreams(
   }
 }
 
+// ── Reconnection / self-healing ────────────────────────────────────────────────
+
+const reconnecting = new Set<string>();
+const retryBackoff = new Map<string, { attempts: number; nextAt: number }>();
+
+/** Heuristic: does this connect error look like an expired/invalid Bearer token? */
+function isUnauthorized(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return msg.includes("401") || msg.includes("unauthorized") || msg.includes("invalid_token");
+}
+
+/**
+ * (Re)connect a single upstream by name and update the shared maps in place.
+ *
+ * Covers the startup race (upstream not yet up at boot), restart/update (stale
+ * client handle), and OAuth token expiry (refresh via stored refresh_token,
+ * then reconnect). The connectedUpstreams map is shared by reference with the
+ * running MCP server, so updating it is immediately visible to tool calls.
+ *
+ * Returns the connected upstream on success, or null.
+ */
+async function reconnectUpstream(name: string): Promise<ConnectedUpstream | null> {
+  const config = allConfigs.find((c) => c.name === name);
+  if (!config) return null;
+  if (reconnecting.has(name)) return null;
+  reconnecting.add(name);
+
+  // Drop any stale handle first so we don't leak the old transport.
+  const existing = connectedUpstreams.get(name);
+  if (existing) {
+    try { await existing.client.close(); } catch { /* ignore */ }
+    connectedUpstreams.delete(name);
+  }
+
+  try {
+    let upstream: ConnectedUpstream;
+
+    if (config.auth?.type === "oauth") {
+      const tokens = loadTokens(name);
+      if (!tokens) {
+        upstreamStates.set(name, { config, status: "needs_auth", toolCount: 0 });
+        return null;
+      }
+      try {
+        upstream = await connectOAuthUpstream(config, tokens);
+      } catch (err) {
+        if (!isUnauthorized(err) || !tokens.refresh_token) throw err;
+        // Access token likely expired — refresh via the stored refresh_token and retry once.
+        upstreamStates.set(name, { config, status: "refreshing", toolCount: 0 });
+        const asMetadata = await discoverAuthServer(config.url);
+        const clientCreds = await resolveClientCredentials(name, config.auth, asMetadata, OAUTH_CALLBACK_URI);
+        const refreshed = await refreshAccessToken(asMetadata, clientCreds, tokens.refresh_token, config.url);
+        saveTokens(name, refreshed);
+        upstream = await connectOAuthUpstream(config, refreshed);
+      }
+    } else {
+      upstream = await connectUpstream(config);
+    }
+
+    connectedUpstreams.set(name, upstream);
+    upstreamStates.set(name, { config, status: "connected", toolCount: upstream.tools.length });
+    console.log(`[${name}] Reconnected — ${upstream.tools.length} tool(s)`);
+    return upstream;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const status: UpstreamStatus = config.auth?.type === "oauth" ? "needs_auth" : "error";
+    upstreamStates.set(name, { config, status, error: msg, toolCount: 0 });
+    console.error(`[${name}] Reconnect failed: ${msg}`);
+    return null;
+  } finally {
+    reconnecting.delete(name);
+  }
+}
+
+/**
+ * Background loop that redials any upstream not currently connected, with
+ * per-upstream exponential backoff. Self-heals startup races and dropped
+ * connections without a proxy restart.
+ */
+function startReconnectLoop(): void {
+  setInterval(() => {
+    const now = Date.now();
+    for (const [name, state] of upstreamStates) {
+      if (state.status === "connected" || state.status === "refreshing") continue;
+      // An OAuth upstream with no stored tokens needs interactive auth — skip until then.
+      if (state.status === "needs_auth" && !loadTokens(name)) continue;
+
+      const b = retryBackoff.get(name) ?? { attempts: 0, nextAt: 0 };
+      if (now < b.nextAt) continue;
+
+      void reconnectUpstream(name).then((ok) => {
+        if (ok) {
+          retryBackoff.delete(name);
+        } else {
+          const attempts = b.attempts + 1;
+          const delay = Math.min(30_000 * 2 ** (attempts - 1), 5 * 60_000);
+          retryBackoff.set(name, { attempts, nextAt: Date.now() + delay });
+        }
+      });
+    }
+  }, 10_000);
+}
+
 // ── MCP proxy server ─────────────────────────────────────────────────────────
 
 function buildMcpServer(upstreams: Map<string, ConnectedUpstream>): Server {
@@ -172,6 +276,13 @@ function buildMcpServer(upstreams: Map<string, ConnectedUpstream>): Server {
     try {
       return await upstream.client.callTool({ name: upstreamTool, arguments: request.params.arguments }) as CallToolResult;
     } catch (err) {
+      // Upstream may have restarted/updated or its token expired — redial once and retry.
+      const fresh = await reconnectUpstream(upstreamName);
+      if (fresh) {
+        try {
+          return await fresh.client.callTool({ name: upstreamTool, arguments: request.params.arguments }) as CallToolResult;
+        } catch { /* fall through to the error below */ }
+      }
       return { isError: true, content: [{ type: "text", text: `Error calling ${upstreamName}/${upstreamTool}: ${err instanceof Error ? err.message : String(err)}` }] };
     }
   });
@@ -187,7 +298,7 @@ function serverMetadata(base: string): object {
     authorization_endpoint: `${base}/authorize`,
     token_endpoint: `${base}/token`,
     registration_endpoint: `${base}/register`,
-    grant_types_supported: ["authorization_code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
     response_types_supported: ["code"],
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["none"],
@@ -347,6 +458,18 @@ function startHttpServer(mcpServer: Server, apiKey: string): void {
   app.post("/token", (req: Request, res: Response): void => {
     const body = req.body as Record<string, string>;
 
+    // The issued access token is the static, non-expiring API key. Support a
+    // refresh_token grant (refresh_token === the key) so clients that rotate
+    // renew non-interactively instead of dropping to a full re-authorization.
+    if (body.grant_type === "refresh_token") {
+      if (!safeEqual(body.refresh_token ?? "", apiKey)) {
+        res.status(400).json({ error: "invalid_grant", error_description: "Invalid refresh token" });
+        return;
+      }
+      res.json({ access_token: apiKey, token_type: "bearer", refresh_token: apiKey });
+      return;
+    }
+
     if (body.grant_type !== "authorization_code") {
       res.status(400).json({ error: "unsupported_grant_type" });
       return;
@@ -369,7 +492,10 @@ function startHttpServer(mcpServer: Server, apiKey: string): void {
     }
 
     authCodes.delete(code);
-    res.json({ access_token: apiKey, token_type: "bearer", expires_in: 3600 });
+    // No expires_in: the API key does not expire, so clients treat the token as
+    // long-lived rather than scheduling a refresh/re-auth. refresh_token is
+    // provided as a safety net for clients that rotate regardless.
+    res.json({ access_token: apiKey, token_type: "bearer", refresh_token: apiKey });
   });
 
   // ── Cookie-gated: Dashboard & upstream management ────────────────────────
@@ -593,6 +719,7 @@ async function main(): Promise<void> {
 
   const mcpServer = buildMcpServer(connectedUpstreams);
   startHttpServer(mcpServer, apiKey);
+  startReconnectLoop();
 
   const connected = [...connectedUpstreams.keys()];
   console.log(`[proxy] Aggregating tools from: ${connected.join(", ") || "(none)"}`);
